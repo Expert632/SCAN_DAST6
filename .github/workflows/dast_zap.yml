@@ -1,0 +1,60 @@
+name: DAST ZAP Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  zap-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t dast-lab-app .
+
+      - name: Run vulnerable app container
+        run: |
+          docker run -d -p 3000:3000 --name dast-lab-app dast-lab-app
+          # On attend que l'appli démarre
+          sleep 15
+
+      # Étape principale OWASP ZAP Baseline Scan
+      - name: Run OWASP ZAP Baseline Scan (HTML + JSON + TXT)
+        id: zap_scan
+        uses: zaproxy/action-baseline@v0.10.0
+        continue-on-error: true
+        with:
+          target: "http://localhost:3000"
+          failure_action: "ignore"  # NE DOIT PAS ÉCHOUER LE JOB
+          cmd_options: >
+            -t http://localhost:3000
+            -r zap-report.html
+            -J zap-report.json
+            -w zap-report.txt
+
+      # Afficher un résumé dans les logs (sans jamais casser le job)
+      - name: Show ZAP TXT report in logs
+        if: always()
+        run: |
+          echo "===== Début du rapport texte ZAP (zap-report.txt) ====="
+          if [ -f "zap-report.txt" ]; then
+            cat zap-report.txt
+          else
+            echo "Aucun fichier zap-report.txt trouvé."
+          fi
+          echo "===== Fin du rapport texte ZAP ====="
+
+      # On uploade les rapports en artefacts
+      - name: Upload ZAP reports (HTML, JSON, TXT)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-reports
+          path: |
+            zap-report.html
+            zap-report.json
+            zap-report.txt
