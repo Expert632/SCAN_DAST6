@@ -1,4 +1,4 @@
-name: DAST ZAP Scan - Robust (Always Green)
+name: DAST ZAP Scan - Always Green
 
 on:
   push:
@@ -14,76 +14,109 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Ensure Python and jq available
+      - name: Install jq
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y python3 python3-pip jq
+          sudo apt-get install -y jq
 
-      - name: Start app to scan (Docker if Dockerfile present, else serve repo as static files)
+      - name: Start app to scan
         run: |
-          # If there's a Dockerfile, build & run it; otherwise serve repository with python http.server
+          # Si un Dockerfile existe, on démarre l'app dans un conteneur
           if [ -f Dockerfile ]; then
-            echo "Dockerfile found -> building and running container on port 3000"
+            echo "Dockerfile trouvé -> build et run sur le port 3000"
             docker build -t dast-lab-app .
             docker run -d --name dast-lab-app -p 3000:3000 dast-lab-app || true
-            # wait for port 3000 to be ready (max 60s)
+
+            # attente que le port 3000 soit prêt (max 60s)
             for i in $(seq 1 30); do
               if nc -z localhost 3000; then
-                echo "Port 3000 ready"
+                echo "Port 3000 prêt"
                 break
               fi
-              echo "Waiting for port 3000..."
+              echo "En attente de l'app sur le port 3000..."
               sleep 2
             done
           else
-            echo "No Dockerfile -> serving repo on port 3000 with python http.server"
-            # serve in background
-            (cd $GITHUB_WORKSPACE && python3 -m http.server 3000) &>/tmp/http-server.log & echo $! > /tmp/http-server.pid
-            # simple wait
+            echo "Aucun Dockerfile -> on sert le repo en statique sur le port 3000 (python http.server)"
+            (python3 -m http.server 3000 &>/tmp/http-server.log &) 
+            # simple attente
             for i in $(seq 1 30); do
               if nc -z localhost 3000; then
-                echo "Static server ready on 3000"
+                echo "Serveur statique prêt sur le port 3000"
                 break
               fi
-              echo "Waiting for static server..."
+              echo "En attente du serveur statique..."
               sleep 2
             done
           fi
 
-      - name: Sanity check: list listening ports
+      - name: Check listening ports (debug)
         run: ss -tuln || true
 
-      - name: Run OWASP ZAP Baseline Scan (HTML + JSON + MD)
+      - name: Run OWASP ZAP Baseline Scan
         id: zap_scan
         uses: zaproxy/action-baseline@v0.10.0
         continue-on-error: true
         with:
           target: "http://localhost:3000"
-          fail_action: "ignore"        # important : ne pas échouer le job
+          fail_action: "ignore"        # IMPORTANT : ne jamais échouer le job
           artifact_name: "zap-reports"
           cmd_options: >
             -t http://localhost:3000
             -r report_html.html
             -J report_json.json
             -w report_md.md
-            --scanpolicy /dev/null
 
-      - name: Wait a little to ensure reports flushed
-        if: always()
-        run: sleep 2
-
-      - name: Show TXT/MD report in logs
+      - name: Show ZAP text report in logs
         if: always()
         run: |
-          echo "===== BEGIN ZAP TEXT REPORT (report_md.md) ====="
+          echo "===== DÉBUT DU RAPPORT TEXTE ZAP (report_md.md) ====="
           if [ -f report_md.md ]; then
             sed -n '1,400p' report_md.md || true
           else
-            echo "No report_md.md file found."
+            echo "Fichier report_md.md introuvable."
           fi
-          echo "===== END ZAP TEXT REPORT ====="
+          echo "===== FIN DU RAPPORT TEXTE ZAP ====="
 
-      - name: Upload ZAP reports (artifact)
+      - name: Analyze JSON report and print Vulnerability detected / No Vulnerability detected
+        if: always()
+        run: |
+          echo "Analyse de report_json.json..."
+          ALERTS_COUNT=0
+
+          if [ -f report_json.json ]; then
+            echo "Fichier report_json.json trouvé, tentative de parse avec jq..."
+            # On compte le nombre total d'alertes (toutes severities confondues)
+            COUNT=$(jq '[..|.alerts? // empty] | map(length) | add // 0' report_json.json 2>/dev/null || echo "0")
+
+            # Si jq renvoie un nombre valide, on l'utilise
+            if echo "$COUNT" | grep -E '^[0-9]+$' >/dev/null 2>&1; then
+              ALERTS_COUNT="$COUNT"
+            else
+              # Fallback ultra simple : compter les occurrences du mot "alert"
+              ALERTS_COUNT=$(grep -o '"alert":' -c report_json.json || echo "0")
+            fi
+          else
+            echo "report_json.json introuvable -> on suppose 0 alerte."
+          fi
+
+          echo "Nombre d'alertes estimé : $ALERTS_COUNT"
+
+          if [ "$ALERTS_COUNT" -gt 0 ]; then
+            echo "==============================="
+            echo "Vulnerability detected"
+            echo "Total alerts (approx) : $ALERTS_COUNT"
+            echo "==============================="
+          else
+            echo "==============================="
+            echo "No Vulnerability detected"
+            echo "==============================="
+          fi
+
+          # Très important : ne jamais faire exit 1, quel que soit le résultat
+          exit 0
+
+      - name: Upload ZAP reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -93,62 +126,15 @@ jobs:
             report_json.json
             report_md.md
 
-      - name: Analyze JSON report and print vulnerability summary (always green)
+      - name: Teardown
         if: always()
         run: |
-          echo "Analyzing report_json.json..."
-          if [ -f report_json.json ]; then
-            # Try to extract alerts count robustly (the baseline JSON contains 'site' -> 'alerts' arrays)
-            ALERTS_COUNT=$(jq '[..|.alerts? // empty] | map(length) | add // 0' report_json.json 2>/dev/null || echo "0")
-            # If jq failed above, fallback to grepping "alert"
-            if ! [[ "$ALERTS_COUNT" =~ ^[0-9]+$ ]]; then
-              ALERTS_COUNT=$(grep -o '"alert":' -c report_json.json || true)
-            fi
-            echo "Computed alerts count: $ALERTS_COUNT"
-          else
-            echo "report_json.json not found -> assuming 0 alerts"
-            ALERTS_COUNT=0
-          fi
-
-          if [ "$ALERTS_COUNT" -gt 0 ]; then
-            echo "==== Vulnerability detected ===="
-            echo "Total alerts (approx): $ALERTS_COUNT"
-            # Print a short list of unique alert names if possible (safe printing)
-            echo "Top alert names (if available):"
-            jq -r '[..|.alerts? // empty | .[].alert] | map(select(.!=null)) | unique | .[:20][]' report_json.json 2>/dev/null || true
-            # Do not fail the job; keep exit 0
-            echo "VULNERABILITY_RESULT=detected" >> $GITHUB_OUTPUT || true
-          else
-            echo "==== No Vulnerability detected ===="
-            echo "VULNERABILITY_RESULT=none" >> $GITHUB_OUTPUT || true
-          fi
-
-      - name: Final summary in logs
-        if: always()
-        run: |
-          if [ "${{ steps.analyze_json_report.outcome || 'success' }}" = "failure" ]; then
-            echo "Note: JSON analysis step failed but we ignore failure to keep job green."
-          fi
-          # Try to read GitHub output variable; fallback to scanning file
-          if [ -n "${{ steps.zap_scan.outputs.artifact_name }}" ]; then
-            echo "ZAP artifact name: ${{ steps.zap_scan.outputs.artifact_name }}"
-          fi
-          # Print a clear single-line result for pedagogical parsing
-          if grep -q "Vulnerability detected" report_md.md 2>/dev/null || jq -e '.[0]' report_json.json >/dev/null 2>&1; then
-            echo "::notice::Pipeline result: Vulnerability detected"
-          else
-            echo "::notice::Pipeline result: No Vulnerability detected"
-          fi
-
-      - name: Teardown (stop containers/servers)
-        if: always()
-        run: |
-          # stop docker container if exists
+          # Stopper le conteneur docker si présent
           if docker ps -a --format '{{.Names}}' | grep -q '^dast-lab-app$'; then
             docker rm -f dast-lab-app || true
           fi
-          # stop python server if started
-          if [ -f /tmp/http-server.pid ]; then
-            kill $(cat /tmp/http-server.pid) 2>/dev/null || true
-            rm -f /tmp/http-server.pid || true
+
+          # Stopper le serveur python s'il a été lancé (best effort)
+          if pgrep -f "python3 -m http.server 3000" >/dev/null 2>&1; then
+            pkill -f "python3 -m http.server 3000" || true
           fi
