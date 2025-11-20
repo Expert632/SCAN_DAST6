@@ -1,0 +1,12 @@
+{
+  "name": "dast-lab-app",
+  "version": "1.0.0",
+  "description": "Simple vulnerable app for DAST lab with OWASP ZAP",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0"
+  }
+}
