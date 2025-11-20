@@ -29,32 +29,34 @@ jobs:
         continue-on-error: true
         with:
           target: "http://localhost:3000"
-          failure_action: "ignore"  # NE DOIT PAS ÉCHOUER LE JOB
+          # ⚠️ bon nom d'input : fail_action (et pas failure_action)
+          fail_action: "ignore"        # ne jamais échouer le job
+          artifact_name: "zap-reports" # nom de l'artefact généré par l'action
           cmd_options: >
             -t http://localhost:3000
-            -r zap-report.html
-            -J zap-report.json
-            -w zap-report.txt
+            -J report_json.json
+            -w report_md.md
+            -r report_html.html
 
       # Afficher un résumé dans les logs (sans jamais casser le job)
       - name: Show ZAP TXT report in logs
         if: always()
         run: |
-          echo "===== Début du rapport texte ZAP (zap-report.txt) ====="
-          if [ -f "zap-report.txt" ]; then
-            cat zap-report.txt
+          echo "===== Début du rapport texte ZAP (report_md.md) ====="
+          if [ -f "report_md.md" ]; then
+            cat report_md.md
           else
-            echo "Aucun fichier zap-report.txt trouvé."
+            echo "Aucun fichier report_md.md trouvé."
           fi
           echo "===== Fin du rapport texte ZAP ====="
 
-      # On uploade les rapports en artefacts
+      # On uploade aussi les rapports depuis le workspace courant, au cas où
       - name: Upload ZAP reports (HTML, JSON, TXT)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zap-reports
+          name: zap-reports-manual
           path: |
-            zap-report.html
-            zap-report.json
-            zap-report.txt
+            report_html.html
+            report_json.json
+            report_md.md
