@@ -1,0 +1,132 @@
+name: Security Gate - OWASP ZAP
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  security_gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Start app to scan
+        run: |
+          # Si un Dockerfile existe, on démarre l'app dans un conteneur
+          if [ -f Dockerfile ]; then
+            echo "Dockerfile trouvé -> build et run sur le port 3000"
+            docker build -t dast-lab-app .
+            docker run -d --name dast-lab-app -p 3000:3000 dast-lab-app || true
+
+            # Attendre que le port 3000 soit prêt (max ~60s)
+            for i in $(seq 1 30); do
+              if nc -z localhost 3000; then
+                echo "Port 3000 prêt"
+                break
+              fi
+              echo "En attente de l'app sur le port 3000..."
+              sleep 2
+            done
+          else
+            echo "Aucun Dockerfile -> on sert le repo en statique sur port 3000 (python http.server)"
+            (python3 -m http.server 3000 &>/tmp/http-server.log &) 
+
+            for i in $(seq 1 30); do
+              if nc -z localhost 3000; then
+                echo "Serveur statique prêt sur le port 3000"
+                break
+              fi
+              echo "En attente du serveur statique..."
+              sleep 2
+            done
+          fi
+
+      - name: Run OWASP ZAP Baseline Scan
+        id: zap_scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: "http://localhost:3000"
+          # CI STRICT : on laisse ZAP échouer le job si problème interne
+          fail_action: "warn"          # ou "ignore" si tu veux que seul le gate JSON décide
+          artifact_name: "zap-reports"
+          cmd_options: >
+            -t http://localhost:3000
+            -r report_html.html
+            -J report_json.json
+            -w report_md.md
+
+      - name: Show ZAP text report in logs (optionnel mais pratique)
+        if: always()
+        run: |
+          echo "===== DÉBUT RAPPORT TEXTE ZAP (report_md.md) ====="
+          if [ -f report_md.md ]; then
+            sed -n '1,200p' report_md.md || true
+          else
+            echo "Fichier report_md.md introuvable."
+          fi
+          echo "===== FIN RAPPORT TEXTE ZAP ====="
+
+      - name: SECURITY GATE - Fail on High/Medium
+        if: always()
+        run: |
+          JSON="report_json.json"
+
+          if [ ! -f "$JSON" ]; then
+            echo "❌ report_json.json introuvable, impossible d'appliquer le gate."
+            echo "Par sécurité, on considère qu'il y a un problème -> échec du job."
+            exit 1
+          fi
+
+          echo "Lecture de $JSON..."
+
+          # Chaque alerte ZAP a un champ "risk" : "High", "Medium", "Low", "Informational"
+          HIGH_COUNT=$(jq '[..|.alerts? // empty | .[] | select(.risk == "High")] | length' "$JSON" 2>/dev/null || echo "0")
+          MEDIUM_COUNT=$(jq '[..|.alerts? // empty | .[] | select(.risk == "Medium")] | length' "$JSON" 2>/dev/null || echo "0")
+          LOW_COUNT=$(jq '[..|.alerts? // empty | .[] | select(.risk == "Low")] | length' "$JSON" 2>/dev/null || echo "0")
+          INFO_COUNT=$(jq '[..|.alerts? // empty | .[] | select(.risk == "Informational")] | length' "$JSON" 2>/dev/null || echo "0")
+
+          echo "Résumé des vulnérabilités ZAP :"
+          echo "  High   : $HIGH_COUNT"
+          echo "  Medium : $MEDIUM_COUNT"
+          echo "  Low    : $LOW_COUNT"
+          echo "  Info   : $INFO_COUNT"
+
+          # 🔴 Gate de sécurité : rouge si High ou Medium détecté
+          if [ "$HIGH_COUNT" -gt 0 ] || [ "$MEDIUM_COUNT" -gt 0 ]; then
+            echo "❌ SECURITY GATE: High/Medium vulnerabilities detected -> PIPELINE ROUGE"
+            exit 1
+          else
+            echo "✅ SECURITY GATE: No High/Medium vulnerabilities -> PIPELINE VERT"
+            exit 0
+          fi
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-reports
+          path: |
+            report_html.html
+            report_json.json
+            report_md.md
+
+      - name: Teardown
+        if: always()
+        run: |
+          # Stopper le conteneur docker si présent
+          if docker ps -a --format '{{.Names}}' | grep -q '^dast-lab-app$'; then
+            docker rm -f dast-lab-app || true
+          fi
+          # Stopper le serveur python si lancé
+          if pgrep -f "python3 -m http.server 3000" >/dev/null 2>&1; then
+            pkill -f "python3 -m http.server 3000" || true
+          fi
